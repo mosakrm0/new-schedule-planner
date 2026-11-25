@@ -1,0 +1,17 @@
+{
+  "name": "schedule-app",
+  "version": "1.0.0",
+  "description": "University Schedule Planner for Balqa Applied University",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "compression": "^1.8.1",
+    "dotenv": "^16.4.0",
+    "express": "^5.2.1",
+    "helmet": "^8.2.0",
+    "json5": "^2.2.3"
+  }
+}
