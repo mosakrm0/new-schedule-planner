@@ -69,3 +69,24 @@ test('shouldAcceptScrape rejects empty scrapes, enforces 50% guard when fresh, a
     assert.equal(shouldAcceptScrape(40, 100, staleIso, now), true);
     assert.equal(shouldAcceptScrape(10, 0, freshIso, now), true);
 });
+
+test('stripHtml and processScrapedRows handle numeric fields, literal null rooms, and status precedence', () => {
+    assert.equal(stripHtml(203), '203');
+    const out = processScrapedRows([
+        {
+            dept: 'هندسة الحاسوب',
+            college: 'كلية الهندسة',
+            row: [30801101, 'برمجة', 3, 1, 'ح 08:00 09:00', 'د. علي', 'null || 203', 'متاحة', '']
+        },
+        {
+            dept: 'هندسة الحاسوب',
+            college: 'كلية الهندسة',
+            row: [30801101, 'برمجة', 3, 1, 'ن 09:00 10:00', 'د. علي', 'null', 'مغلقة', '']
+        }
+    ], { includeGraduationProjects: false });
+
+    assert.equal(out.length, 1);
+    assert.equal(out[0]['رقم المادة'], '30801101');
+    assert.equal(out[0]['القاعات'], '203');
+    assert.equal(out[0]['الحالة'], 'مغلقة');
+});

@@ -2,11 +2,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     to24,
+    getSectionMode,
+    isBlendedSection,
+    isOnlineSection,
     parseMultiSlots,
+    parseSlotPairMinutes,
     parseSectionSlots,
     checkConflict,
+    countBreakMinutes,
     mergeDayIntervals,
     scoreSchedule,
+    filterCourseSections,
     solveSchedules
 } = require('../public/schedule-core');
 
@@ -129,4 +135,88 @@ test('solveSchedules returns true Top-K, filters closed/excluded days, and repor
     const threeWay = solveSchedules([x, y, z]);
     assert.equal(threeWay.totalFound, 0);
     assert.equal(threeWay.conflictReason, 'multi_way');
+});
+
+test('getSectionMode distinguishes onsite, blended (مدمج / ON LINE), and pure online', () => {
+    const pureOnline = makeSection('ON1', '1', 'ح ن 04:00 05:00', 'متاحة', 'ON LINE 1');
+    assert.equal(getSectionMode(pureOnline), 'online');
+    assert.equal(isOnlineSection(pureOnline), true);
+    assert.equal(isBlendedSection(pureOnline), false);
+
+    const blendedSpace = makeSection('BL1', '1', 'ح ن 10:30 12:30', 'متاحة', 'E304 || ON LINE');
+    blendedSpace['ملاحظات'] = 'مدمج';
+    assert.equal(getSectionMode(blendedSpace), 'blended');
+    assert.equal(isOnlineSection(blendedSpace), false);
+    assert.equal(isBlendedSection(blendedSpace), true);
+
+    const blendedMixed = makeSection('BL2', '1', 'ث ر 10:00 11:30', 'متاحة', 'online || 203');
+    assert.equal(getSectionMode(blendedMixed), 'blended');
+    assert.equal(isOnlineSection(blendedMixed), false);
+
+    const onsite = makeSection('OS1', '1', 'ح ث 09:00 10:00', 'متاحة', 'قاعة 101');
+    assert.equal(getSectionMode(onsite), 'onsite');
+    assert.equal(isOnlineSection(onsite), false);
+});
+
+test('parseSlotPairMinutes resolves noon-crossing, morning, 07:xx clinical, 06:xx evening, and 24h slots', () => {
+    assert.deepEqual(parseSlotPairMinutes('11:30', '01:00', 'blended'), { start: 11 * 60 + 30, end: 13 * 60 });
+    assert.deepEqual(parseSlotPairMinutes('10:00', '11:30', 'blended'), { start: 10 * 60, end: 11 * 60 + 30 });
+    assert.deepEqual(parseSlotPairMinutes('10:00', '11:20', 'online'), { start: 10 * 60, end: 11 * 60 + 20 });
+    assert.deepEqual(parseSlotPairMinutes('07:00', '10:00', 'onsite'), { start: 7 * 60, end: 10 * 60 });
+    assert.deepEqual(parseSlotPairMinutes('07:30', '07:30', 'onsite'), { start: 7 * 60 + 30, end: 19 * 60 + 30 });
+    assert.deepEqual(parseSlotPairMinutes('06:00', '07:30', 'online'), { start: 18 * 60, end: 19 * 60 + 30 });
+    assert.deepEqual(parseSlotPairMinutes('14:30', '17:30', 'onsite'), { start: 14 * 60 + 30, end: 17 * 60 + 30 });
+});
+
+test('blended morning/noon sections conflict with overlapping onsite sections', () => {
+    const blended = parseSectionSlots({
+        'اسم المادة': 'BL',
+        'ش.': '1',
+        'رقم المادة': 'B101',
+        'س.': '3',
+        'الاوقات': 'ح ن 11:30 01:00',
+        'القاعات': '7ج / ONLINE',
+        'الحالة': 'متاحة',
+        'ملاحظات': 'مدمج'
+    });
+    const onsite = makeSection('OS', '1', 'ح ن 12:00 01:00');
+    assert.equal(checkConflict(blended, onsite), true);
+});
+
+test('countBreakMinutes merges overlapping slots before computing gaps', () => {
+    const s = makeSection('M', '1', 'ح 08:30 11:30 || ح 09:00 10:00 || ح 11:30 12:30');
+    assert.equal(countBreakMinutes([s]), 0);
+});
+
+test('parseMultiSlots handles consecutive time pairs on shared days', () => {
+    assert.deepEqual(parseMultiSlots('ح ث 08:30 09:30 10:30 11:30'), [
+        { days: ['ح', 'ث'], start: '08:30', end: '09:30' },
+        { days: ['ح', 'ث'], start: '10:30', end: '11:30' }
+    ]);
+});
+
+test('filterCourseSections handles undefined options and filters blended excludedDays', () => {
+    const blended = parseSectionSlots({
+        'اسم المادة': 'BL',
+        'ش.': '1',
+        'رقم المادة': 'B101',
+        'س.': '3',
+        'الاوقات': 'خ 10:00 11:00',
+        'القاعات': 'ONLINE || 203',
+        'الحالة': 'متاحة',
+        'ملاحظات': 'مدمج'
+    });
+    assert.equal(filterCourseSections([blended]).length, 1);
+    assert.equal(filterCourseSections([blended], { excludedDays: ['خ'] }).length, 0);
+});
+
+test('solveSchedules terminates on timeout even when zero valid schedules exist', () => {
+    const courses = Array.from({ length: 10 }, (_, ci) =>
+        Array.from({ length: 4 }, (__, si) =>
+            makeSection(`C${ci}`, String(si + 1), 'ح 09:00 10:00')
+        )
+    );
+    const res = solveSchedules(courses, { timeLimitMs: 1 });
+    assert.equal(res.totalFound, 0);
+    assert.ok(res.conflictReason === 'pairwise' || res.conflictReason === 'timeout');
 });

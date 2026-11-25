@@ -37,10 +37,36 @@
         return (h >= 1 && h <= 7) ? h + 12 : h;
     }
 
+    function getSectionMode(section) {
+        if (!section) return 'onsite';
+        const rooms = String(section['القاعات'] || '');
+        const times = String(section['الاوقات'] || '');
+        const remarks = String(section['ملاحظات'] || '');
+
+        const hasOnlineRoom = /\bon\s*line\b/i.test(rooms);
+        const hasOnlineText = /\bon\s*line\b/i.test(times)
+            || times.includes('عن بعد')
+            || /\bon\s*line\b/i.test(remarks)
+            || remarks.includes('عن بعد');
+        const hasBlendedWord = remarks.includes('مدمج') || rooms.includes('مدمج');
+
+        const roomTokens = rooms
+            .split(/\s*(?:\|\||\/)\s*/)
+            .map(t => t.trim())
+            .filter(t => t !== '' && !/^null$/i.test(t));
+        const hasPhysicalRoom = roomTokens.some(t => !/\bon\s*line\b/i.test(t) && !t.includes('عن بعد'));
+
+        if (hasBlendedWord || (hasOnlineRoom && hasPhysicalRoom)) return 'blended';
+        if (hasOnlineRoom || hasOnlineText) return 'online';
+        return 'onsite';
+    }
+
+    function isBlendedSection(section) {
+        return getSectionMode(section) === 'blended';
+    }
+
     function isOnlineSection(section) {
-        if (!section) return false;
-        const fields = [section['القاعات'], section['الاوقات'], section['ملاحظات']];
-        return fields.some(f => f && (String(f).toLowerCase().includes('online') || String(f).includes('عن بعد')));
+        return getSectionMode(section) === 'online';
     }
 
     function isClosedSection(section) {
@@ -71,10 +97,20 @@
 
         for (const p of parts) {
             if (DAY_CHARS.has(p)) {
-                if (times.length === 2) flush();
+                if (times.length === 2) {
+                    flush();
+                } else if (times.length > 0) {
+                    days = [];
+                    times = [];
+                }
                 days.push(p);
             } else if (/^\d{1,2}:\d{2}$/.test(p)) {
-                times.push(p);
+                if (times.length === 2 && days.length > 0) {
+                    slots.push({ days: [...days], start: times[0], end: times[1] });
+                    times = [p];
+                } else {
+                    times.push(p);
+                }
             }
         }
         flush();
@@ -90,17 +126,49 @@
         return to24(parts[0], isOnline) * 60 + parts[1];
     }
 
+    function parseSlotPairMinutes(startStr, endStr, mode) {
+        const sParts = String(startStr || '').split(':').map(Number);
+        const eParts = String(endStr || '').split(':').map(Number);
+        if (sParts.length !== 2 || eParts.length !== 2) return { start: 0, end: 0 };
+        const [h1, m1] = sParts;
+        const [h2, m2] = eParts;
+        if (![h1, m1, h2, m2].every(Number.isFinite)) return { start: 0, end: 0 };
+
+        let sh;
+        if (h1 >= 13 || h1 === 0) sh = h1;
+        else if (h1 >= 1 && h1 <= 6) sh = h1 + 12;
+        else if (h1 === 7) sh = (mode === 'online' && h2 >= 8 && h2 <= 9) ? 19 : 7;
+        else sh = h1;
+
+        let eh;
+        if (h2 >= 13 || h2 === 0) eh = h2;
+        else if (h2 >= 1 && h2 <= 7) eh = h2 + 12;
+        else eh = h2;
+
+        const s = sh * 60 + m1;
+        let e = eh * 60 + m2;
+        if (s >= e && h2 >= 1 && h2 <= 11 && (eh + 12) <= 23) {
+            eh += 12;
+            e = eh * 60 + m2;
+        }
+        return { start: s, end: e };
+    }
+
     function parseSectionSlots(section) {
-        const online = isOnlineSection(section);
+        const mode = getSectionMode(section);
         const rawSlots = parseMultiSlots(section['الاوقات']);
+        section._mode = mode;
         section._rawSlots = rawSlots;
         section._parsedSlots = rawSlots
             .filter(slot => slot.days && slot.start && slot.end)
-            .map(slot => ({
-                days: slot.days,
-                start: slotTimeToMinutes(slot.start, online),
-                end: slotTimeToMinutes(slot.end, online)
-            }));
+            .map(slot => {
+                const pair = parseSlotPairMinutes(slot.start, slot.end, mode);
+                return {
+                    days: slot.days,
+                    start: pair.start,
+                    end: pair.end
+                };
+            });
         return section;
     }
 
@@ -143,9 +211,9 @@
 
         let totalBreaks = 0;
         Object.values(dayMap).forEach(slots => {
-            slots.sort((a, b) => a.start - b.start);
-            for (let i = 0; i < slots.length - 1; i++) {
-                const gap = slots[i + 1].start - slots[i].end;
+            const merged = mergeDayIntervals(slots);
+            for (let i = 0; i < merged.length - 1; i++) {
+                const gap = merged[i + 1].start - merged[i].end;
                 if (gap > 0) totalBreaks += gap;
             }
         });
@@ -234,8 +302,9 @@
     }
 
     function filterCourseSections(sections, options) {
-        const openOnly = Boolean(options.openOnly);
-        const excludedSet = new Set(Array.isArray(options.excludedDays) ? options.excludedDays : []);
+        const opts = options || {};
+        const openOnly = Boolean(opts.openOnly);
+        const excludedSet = new Set(Array.isArray(opts.excludedDays) ? opts.excludedDays : []);
 
         return sections.filter(sec => {
             if (openOnly && isClosedSection(sec)) return false;
@@ -262,7 +331,9 @@
                 validSchedules: [],
                 totalFound: 0,
                 wasCapped: false,
+                stoppedEarly: false,
                 incompatiblePairs: [],
+                incompatiblePairTuples: [],
                 conflictReason: '',
                 filteredOutCourses: []
             };
@@ -285,7 +356,9 @@
                 validSchedules: [],
                 totalFound: 0,
                 wasCapped: false,
+                stoppedEarly: false,
                 incompatiblePairs: [],
+                incompatiblePairTuples: [],
                 conflictReason: 'filtered_out',
                 filteredOutCourses
             };
@@ -295,6 +368,7 @@
         const ordered = [...filteredCourses].sort((a, b) => a.length - b.length);
         const topK = [];
         let totalFound = 0;
+        let nodesVisited = 0;
         let stoppedEarly = false;
         const startTime = Date.now();
 
@@ -313,7 +387,7 @@
 
         function backtrack(idx, current) {
             if (stoppedEarly) return;
-            if (totalFound >= maxEvaluations || (totalFound > 0 && totalFound % 256 === 0 && (Date.now() - startTime) >= timeLimitMs)) {
+            if (totalFound >= maxEvaluations || ((++nodesVisited & 1023) === 0 && (Date.now() - startTime) >= timeLimitMs)) {
                 stoppedEarly = true;
                 return;
             }
@@ -346,6 +420,7 @@
         backtrack(0, []);
 
         const incompatiblePairs = [];
+        const incompatiblePairTuples = [];
         let conflictReason = '';
         if (totalFound === 0) {
             for (let i = 0; i < ordered.length; i++) {
@@ -366,10 +441,11 @@
                         const n1 = courseA[0]._courseName || courseA[0]['اسم المادة'];
                         const n2 = courseB[0]._courseName || courseB[0]['اسم المادة'];
                         incompatiblePairs.push(`${n1} | ${n2}`);
+                        incompatiblePairTuples.push([n1, n2]);
                     }
                 }
             }
-            conflictReason = incompatiblePairs.length > 0 ? 'pairwise' : 'multi_way';
+            conflictReason = incompatiblePairs.length > 0 ? 'pairwise' : (stoppedEarly ? 'timeout' : 'multi_way');
         }
 
         return {
@@ -377,7 +453,9 @@
             validSchedules: topK.map(item => item.schedule),
             totalFound,
             wasCapped: totalFound > maxSchedules || stoppedEarly,
+            stoppedEarly,
             incompatiblePairs,
+            incompatiblePairTuples,
             conflictReason,
             filteredOutCourses: []
         };
@@ -390,10 +468,13 @@
         CALENDAR_DAY_ORDER,
         normalizeAr,
         to24,
+        getSectionMode,
+        isBlendedSection,
         isOnlineSection,
         isClosedSection,
         parseMultiSlots,
         slotTimeToMinutes,
+        parseSlotPairMinutes,
         parseSectionSlots,
         checkConflict,
         countDays,

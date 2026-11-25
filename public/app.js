@@ -3,7 +3,8 @@ const {
     DAY_ORDER,
     CALENDAR_DAY_ORDER,
     normalizeAr,
-    to24,
+    getSectionMode,
+    isBlendedSection,
     isOnlineSection,
     isClosedSection,
     parseMultiSlots,
@@ -27,6 +28,8 @@ function esc(str) {
 function showToast(msg, duration = 3000) {
     const t = document.createElement('div');
     t.className = 'toast';
+    t.setAttribute('role', 'status');
+    t.setAttribute('aria-live', 'polite');
     t.textContent = msg;
     document.body.appendChild(t);
     void t.offsetWidth;
@@ -39,7 +42,8 @@ function showToast(msg, duration = 3000) {
 
 // =================== Global State ===================
 let allSections = [];
-let coursesByName = {};
+let coursesByKey = {};
+let courseMetaByKey = {};
 let coursesByDept = {};
 let selectedCourses = new Set();
 let currentPage = 1;
@@ -47,16 +51,26 @@ let currentSchedules = [];
 let lastSortedSchedules = [];
 let lastTotalFound = 0;
 let lastWasCapped = false;
+let lastStoppedEarly = false;
 let lastConflicts = [];
+let lastConflictTuples = [];
 let lastConflictReason = '';
 let lastFilteredOutCourses = [];
 let scheduleWorker = null;
+let csvAbortController = null;
+let csvLoadSeq = 0;
+let resultsStale = false;
+const expandedDepts = new Set();
+let hasInitializedAccordion = false;
 const ITEMS_PER_PAGE = 10;
 
 let currentServer = '';
 let currentDegree = '';
 let currentSubCollege = '';
 let availableFiles = new Set();
+
+const VALID_SORT_MODES = new Set(['balanced', 'fewest_days', 'least_breaks', 'morning', 'afternoon']);
+const VALID_DAYS = new Set(DAY_ORDER);
 
 let userPrefs = {
     sortMode: 'balanced',
@@ -108,24 +122,40 @@ function restoreSelectionsFromStorage() {
         currentServer = readWithMigration(SERVER_KEY) || '';
         currentDegree = readWithMigration(DEGREE_KEY) || '';
         currentSubCollege = readWithMigration(SUBCOLLEGE_KEY) || '';
+    } catch (_) { }
 
+    try {
         const saved = readWithMigration(STORAGE_KEY);
         if (saved) {
             const arr = JSON.parse(saved);
-            if (Array.isArray(arr)) arr.forEach(name => selectedCourses.add(name));
-        }
-
-        const savedPrefs = localStorage.getItem(PREFS_KEY);
-        if (savedPrefs) {
-            const parsed = JSON.parse(savedPrefs);
-            if (parsed && typeof parsed === 'object') {
-                if (typeof parsed.sortMode === 'string') userPrefs.sortMode = parsed.sortMode;
-                if (typeof parsed.openOnly === 'boolean') userPrefs.openOnly = parsed.openOnly;
-                if (Array.isArray(parsed.excludedDays)) userPrefs.excludedDays = parsed.excludedDays;
+            if (Array.isArray(arr)) {
+                arr.forEach(item => {
+                    if (typeof item === 'string' && item.trim()) selectedCourses.add(item);
+                });
             }
         }
     } catch (_) {
         try { localStorage.removeItem(STORAGE_KEY); } catch (_) { }
+    }
+
+    try {
+        const savedPrefs = localStorage.getItem(PREFS_KEY);
+        if (savedPrefs) {
+            const parsed = JSON.parse(savedPrefs);
+            if (parsed && typeof parsed === 'object') {
+                if (typeof parsed.sortMode === 'string' && VALID_SORT_MODES.has(parsed.sortMode)) {
+                    userPrefs.sortMode = parsed.sortMode;
+                }
+                if (typeof parsed.openOnly === 'boolean') {
+                    userPrefs.openOnly = parsed.openOnly;
+                }
+                if (Array.isArray(parsed.excludedDays)) {
+                    userPrefs.excludedDays = [...new Set(parsed.excludedDays.filter(d => VALID_DAYS.has(d)))];
+                }
+            }
+        }
+    } catch (_) {
+        try { localStorage.removeItem(PREFS_KEY); } catch (_) { }
     }
 }
 
@@ -141,22 +171,33 @@ function normalizeCSVRow(row) {
 }
 
 function getCourseName(section) {
-    const name = (section['اسم المادة'] || '').trim();
+    const name = String(section['اسم المادة'] || '').trim();
     if (name && !/^\d+$/.test(name)) return name;
     const keys = Object.keys(section).filter(k => !k.startsWith('_'));
     if (keys.length >= 3) {
-        const third = (section[keys[2]] || '').trim();
+        const third = String(section[keys[2]] || '').trim();
         if (third && !/^\d+$/.test(third)) return third;
     }
     return '';
 }
 
-function getDept(section) {
-    return (section['القسم'] || section[Object.keys(section).find(k => !k.startsWith('_'))] || 'أخرى').trim();
+function getCourseCode(section) {
+    return String(section['رقم المادة'] || '').trim();
 }
 
-function getCourseCredits(courseName) {
-    const secs = coursesByName[courseName];
+function getDept(section) {
+    return String(section['القسم'] || 'أخرى').trim() || 'أخرى';
+}
+
+function getCourseKey(section) {
+    const code = getCourseCode(section);
+    const name = getCourseName(section);
+    const dept = getDept(section);
+    return code ? `${code}::${dept}` : `${name}::${dept}`;
+}
+
+function getCourseCredits(courseKey) {
+    const secs = coursesByKey[courseKey];
     if (!secs || secs.length === 0) return 0;
     const hrs = parseFloat(String(secs[0]['س.'] || '').trim());
     return Number.isFinite(hrs) ? hrs : 0;
@@ -164,15 +205,15 @@ function getCourseCredits(courseName) {
 
 function getTotalSelectedCredits() {
     let total = 0;
-    selectedCourses.forEach(name => {
-        total += getCourseCredits(name);
+    selectedCourses.forEach(key => {
+        total += getCourseCredits(key);
     });
     return total;
 }
 
 const subCollegeCache = {};
 
-function populateSubCollegeOptions(sortedColleges) {
+function populateSubCollegeOptions(sortedColleges, syncActiveState = false) {
     const subCollegeSelect = document.getElementById('subCollegeSelect');
     if (!subCollegeSelect) return;
 
@@ -188,28 +229,31 @@ function populateSubCollegeOptions(sortedColleges) {
     const optExists = [...subCollegeSelect.options].some(o => o.value === preferred);
     if (optExists) {
         subCollegeSelect.value = preferred;
-        currentSubCollege = preferred;
+        if (syncActiveState) currentSubCollege = preferred;
     } else {
         subCollegeSelect.value = '';
-        currentSubCollege = '';
+        if (syncActiveState) currentSubCollege = '';
     }
 }
 
 function populateSubColleges(rawSections) {
     const colleges = new Set();
     rawSections.forEach(s => {
-        const c = (s['الكلية'] || '').trim();
+        const c = String(s['الكلية'] || '').trim();
         if (c && c !== 'عام') colleges.add(c);
     });
     const sorted = [...colleges].sort((a, b) => a.localeCompare(b, 'ar'));
-    populateSubCollegeOptions(sorted);
+    if (currentDegree) {
+        subCollegeCache[currentDegree] = sorted;
+    }
+    populateSubCollegeOptions(sorted, true);
 }
 
 async function preloadSubColleges(degree) {
     if (typeof Papa === 'undefined') return;
     const targetDeg = (degree === '2' || degree === '3') ? degree : '3';
     if (subCollegeCache[targetDeg]) {
-        populateSubCollegeOptions(subCollegeCache[targetDeg]);
+        populateSubCollegeOptions(subCollegeCache[targetDeg], false);
         return;
     }
 
@@ -224,40 +268,70 @@ async function preloadSubColleges(degree) {
             const colleges = new Set();
             (parsed.data || []).forEach(raw => {
                 const row = normalizeCSVRow(raw);
-                const c = (row['الكلية'] || '').trim();
+                const c = String(row['الكلية'] || '').trim();
                 if (c && c !== 'عام') colleges.add(c);
             });
             const sorted = [...colleges].sort((a, b) => a.localeCompare(b, 'ar'));
             subCollegeCache[deg] = sorted;
             const serverSelect = document.getElementById('serverSelect');
             if (serverSelect && serverSelect.value === 'center') {
-                populateSubCollegeOptions(sorted);
+                populateSubCollegeOptions(sorted, false);
             }
             return;
         } catch (_) { /* ignore and try next candidate */ }
     }
 }
 
+function stopScheduleWorker() {
+    if (scheduleWorker) {
+        scheduleWorker.terminate();
+        scheduleWorker = null;
+    }
+    const btnGenerate = document.getElementById('btnGenerate');
+    if (btnGenerate) btnGenerate.disabled = selectedCourses.size === 0;
+}
+
 async function loadCSV(forceRevalidate) {
+    const courseList = document.getElementById('courseList');
     if (!currentServer || !currentDegree) {
-        document.getElementById('courseList').innerHTML = `
+        courseList.innerHTML = `
             <div class="course-list-placeholder">
                 يرجى تحديد الكلية والدرجة العلمية أولاً من الأعلى للبدء.
             </div>`;
         return;
     }
-    const courseList = document.getElementById('courseList');
+
+    if (typeof Papa === 'undefined') {
+        courseList.innerHTML = `
+            <div class="course-list-error">
+                تعذّر تحميل مكتبة قراءة البيانات.<br>
+                <span>يرجى التحقق من اتصال الإنترنت وإعادة تحميل الصفحة.</span>
+            </div>`;
+        return;
+    }
+
+    if (csvAbortController) {
+        csvAbortController.abort();
+    }
+    csvAbortController = new AbortController();
+    const requestSeq = ++csvLoadSeq;
+
     courseList.innerHTML = '<div class="sidebar-skeleton"><div class="skeleton-bar"></div><div class="skeleton-bar short"></div><div class="skeleton-bar"></div><div class="skeleton-bar short"></div><div class="skeleton-bar"></div></div>';
     try {
         const fileKey = `${currentServer}_${currentDegree}`;
-        const fetchOpts = forceRevalidate ? { cache: 'no-cache' } : {};
+        const fetchOpts = { signal: csvAbortController.signal };
+        if (forceRevalidate) fetchOpts.cache = 'no-cache';
+
         const response = await fetch(`data/${fileKey}.csv`, fetchOpts);
+        if (requestSeq !== csvLoadSeq) return;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         let text = await response.text();
+        if (requestSeq !== csvLoadSeq) return;
+
         text = text.replace(/^\uFEFF/, '');
         const result = Papa.parse(text, { header: true, skipEmptyLines: true, dynamicTyping: false });
         const rows = (result.data || []).map(normalizeCSVRow);
-        const rawSections = rows.filter(row => row['الحالة'] && row['الحالة'].trim() !== 'ملغاة');
+        const rawSections = rows.filter(row => row['الحالة'] && String(row['الحالة']).trim() !== 'ملغاة');
 
         if (currentServer === 'center') {
             populateSubColleges(rawSections);
@@ -265,40 +339,84 @@ async function loadCSV(forceRevalidate) {
 
         if (currentServer === 'center' && currentSubCollege) {
             const normSub = normalizeAr(currentSubCollege);
-            allSections = rawSections.filter(s => normalizeAr(s['الكلية']) === normSub || (s['الكلية'] || '').trim() === 'عام');
+            allSections = rawSections.filter(s => normalizeAr(s['الكلية']) === normSub || String(s['الكلية'] || '').trim() === 'عام');
         } else {
             allSections = rawSections;
         }
 
         allSections.forEach(section => parseSectionSlots(section));
 
-        coursesByName = {};
+        coursesByKey = {};
+        courseMetaByKey = {};
         allSections.forEach(section => {
             const name = getCourseName(section);
             if (!name) return;
-            if (!coursesByName[name]) coursesByName[name] = [];
-            coursesByName[name].push(section);
+            const code = getCourseCode(section);
+            const dept = getDept(section);
+            const key = getCourseKey(section);
+            section._courseKey = key;
+            section._courseName = name;
+            if (!coursesByKey[key]) {
+                coursesByKey[key] = [];
+                courseMetaByKey[key] = { key, code, name, dept };
+            }
+            coursesByKey[key].push(section);
         });
 
         coursesByDept = {};
-        Object.keys(coursesByName).forEach(name => {
-            const deptsForCourse = new Set(coursesByName[name].map(s => getDept(s)));
-            deptsForCourse.forEach(dept => {
-                if (!coursesByDept[dept]) coursesByDept[dept] = [];
-                if (!coursesByDept[dept].includes(name)) coursesByDept[dept].push(name);
+        Object.keys(coursesByKey).forEach(key => {
+            const dept = courseMetaByKey[key].dept;
+            if (!coursesByDept[dept]) coursesByDept[dept] = [];
+            coursesByDept[dept].push(key);
+        });
+        Object.keys(coursesByDept).forEach(dept => {
+            coursesByDept[dept].sort((a, b) => {
+                const nameA = courseMetaByKey[a]?.name || a;
+                const nameB = courseMetaByKey[b]?.name || b;
+                const cmp = nameA.localeCompare(nameB, 'ar');
+                if (cmp !== 0) return cmp;
+                return (courseMetaByKey[a]?.code || '').localeCompare(courseMetaByKey[b]?.code || '');
             });
         });
-        Object.keys(coursesByDept).forEach(dept => { coursesByDept[dept].sort(); });
 
-        [...selectedCourses].forEach(name => {
-            if (!coursesByName[name]) selectedCourses.delete(name);
-        });
+        // Migrate legacy name-only selections from localStorage and prune invalid keys
+        let selectionChanged = false;
+        const migrated = new Set();
+        for (const item of selectedCourses) {
+            if (coursesByKey[item]) {
+                migrated.add(item);
+            } else {
+                selectionChanged = true;
+                const matches = Object.keys(courseMetaByKey).filter(k => courseMetaByKey[k].name === item);
+                if (matches.length > 0) {
+                    migrated.add(matches[0]);
+                }
+            }
+        }
+        selectedCourses = migrated;
+        if (selectionChanged) {
+            currentSchedules = [];
+            lastSortedSchedules = [];
+            lastTotalFound = 0;
+            lastWasCapped = false;
+            lastStoppedEarly = false;
+            lastConflicts = [];
+            lastConflictTuples = [];
+            lastConflictReason = '';
+            lastFilteredOutCourses = [];
+            saveSelectionsToStorage();
+            resetResultsToEmpty();
+        }
+
+        expandedDepts.clear();
+        hasInitializedAccordion = false;
 
         updateStats();
         renderCourseList(document.getElementById('searchInput').value.trim());
         updateSelectedCountUI();
         renderSelectedPanel();
     } catch (err) {
+        if (err && err.name === 'AbortError') return;
         console.error('Error loading CSV:', err);
         courseList.innerHTML = `
             <div class="course-list-error">
@@ -309,31 +427,38 @@ async function loadCSV(forceRevalidate) {
 }
 
 // =================== Time Formatter ===================
-function format12(t, isOnline = false) {
-    if (!t) return t;
-    const [h, m] = t.split(':').map(Number);
-    const h24 = to24(h, isOnline);
+function formatMinutes12(mins) {
+    const h24 = Math.floor(mins / 60);
+    const mm = String(mins % 60).padStart(2, '0');
     const period = h24 >= 12 ? 'م' : 'ص';
-    const display = h24 > 12 ? h24 - 12 : (h24 === 0 ? 12 : h24);
-    return `${display}:${String(m).padStart(2, '0')} ${period}`;
+    const h12 = h24 > 12 ? h24 - 12 : (h24 === 0 ? 12 : h24);
+    return `${h12}:${mm} ${period}`;
 }
 
-function formatTimeSlotsHTML(section, isOnline = false) {
-    const slots = section._rawSlots || parseMultiSlots(typeof section === 'string' ? section : section['الاوقات']);
-    if (slots.length === 0) return '<span class="time-empty">—</span>';
-    return slots.map(slot => {
+function formatTimeSlotsHTML(section) {
+    const parsed = section._parsedSlots;
+    const rawSlots = section._rawSlots || parseMultiSlots(typeof section === 'string' ? section : section['الاوقات']);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.map(slot => {
+            const sortedDays = [...slot.days].sort((a, b) => DAY_ORDER.indexOf(a) - DAY_ORDER.indexOf(b));
+            const dayLabels = sortedDays.map(d => `<span class="time-day">${esc(DAY_FULL[d] || d)}</span>`).join('');
+            return `<span class="time-slot">${dayLabels}<span class="time-range">${esc(formatMinutes12(slot.start))}–${esc(formatMinutes12(slot.end))}</span></span>`;
+        }).join('');
+    }
+    if (!rawSlots || rawSlots.length === 0) return '<span class="time-empty">—</span>';
+    return rawSlots.map(slot => {
         if (slot.raw) return `<span class="time-slot"><span class="time-range">${esc(slot.raw)}</span></span>`;
         const sortedDays = [...slot.days].sort((a, b) => DAY_ORDER.indexOf(a) - DAY_ORDER.indexOf(b));
         const dayLabels = sortedDays.map(d => `<span class="time-day">${esc(DAY_FULL[d] || d)}</span>`).join('');
-        return `<span class="time-slot">${dayLabels}<span class="time-range">${esc(format12(slot.start, isOnline))}–${esc(format12(slot.end, isOnline))}</span></span>`;
+        return `<span class="time-slot">${dayLabels}<span class="time-range">${esc(slot.start)}–${esc(slot.end)}</span></span>`;
     }).join('');
 }
 
 // =================== Stats & Metadata ===================
 function updateStats() {
-    document.getElementById('totalCoursesCount').textContent = Object.keys(coursesByName).length;
+    document.getElementById('totalCoursesCount').textContent = Object.keys(coursesByKey).length;
     document.getElementById('totalSectionsCount').textContent = allSections.length;
-    const depts = new Set(allSections.map(s => s['القسم']).filter(Boolean));
+    const depts = new Set(allSections.map(s => getDept(s)).filter(Boolean));
     document.getElementById('totalDeptsCount').textContent = depts.size;
 }
 
@@ -383,7 +508,7 @@ let currentLastUpdate = null;
 
 async function fetchLastUpdate() {
     try {
-        const res = await fetch('/last-update');
+        const res = await fetch('/last-update', { cache: 'no-store' });
         const data = await res.json();
         if (data?.files && typeof data.files === 'object') {
             availableFiles = new Set(Object.keys(data.files));
@@ -398,7 +523,8 @@ async function fetchLastUpdate() {
 
         if (fileTime) {
             if (currentLastUpdate && currentLastUpdate !== fileTime) {
-                loadCSV(true);
+                await loadCSV(true);
+                showToast('تم تحديث بيانات المواد تلقائياً');
             }
             currentLastUpdate = fileTime;
             showLastUpdate(fileTime);
@@ -413,7 +539,9 @@ function renderCourseList(filter = '') {
     const container = document.getElementById('courseList');
     if (!currentServer || !currentDegree) return;
 
+    const prevScrollTop = container.scrollTop;
     const normFilter = normalizeAr(filter);
+    const rawFilterLower = filter.toLowerCase();
 
     const depts = Object.keys(coursesByDept).sort((a, b) => {
         const target = 'مشاريع التخرج';
@@ -422,29 +550,46 @@ function renderCourseList(filter = '') {
         return a.localeCompare(b, 'ar');
     });
 
+    if (!hasInitializedAccordion && depts.length > 0) {
+        expandedDepts.add(depts[0]);
+        hasInitializedAccordion = true;
+    }
+
     const fragment = document.createDocumentFragment();
 
-    depts.forEach((dept, dIdx) => {
-        let courses = coursesByDept[dept] || [];
-        if (normFilter) courses = courses.filter(c => normalizeAr(c).includes(normFilter));
-        if (courses.length === 0) return;
+    depts.forEach(dept => {
+        let courseKeys = coursesByDept[dept] || [];
+        if (normFilter) {
+            courseKeys = courseKeys.filter(key => {
+                const meta = courseMetaByKey[key];
+                if (!meta) return false;
+                return normalizeAr(meta.name).includes(normFilter)
+                    || (rawFilterLower && meta.code.toLowerCase().includes(rawFilterLower));
+            });
+        }
+        if (courseKeys.length === 0) return;
 
+        const isOpen = Boolean(normFilter) || expandedDepts.has(dept);
         const group = document.createElement('div');
-        group.className = 'level-group' + (dIdx === 0 || normFilter ? ' open' : '');
+        group.className = 'level-group' + (isOpen ? ' open' : '');
 
         const header = document.createElement('div');
         header.className = 'level-header';
         header.innerHTML = `
             <span class="level-badge"></span>
             <span class="level-title">${esc(dept)}</span>
-            <span class="level-count">${courses.length}</span>
+            <span class="level-count">${courseKeys.length}</span>
             <span class="level-chevron">◀</span>`;
         header.setAttribute('tabindex', '0');
         header.setAttribute('role', 'button');
-        header.setAttribute('aria-expanded', group.classList.contains('open') ? 'true' : 'false');
+        header.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
         header.addEventListener('click', () => {
-            group.classList.toggle('open');
-            header.setAttribute('aria-expanded', group.classList.contains('open') ? 'true' : 'false');
+            const nowOpen = group.classList.toggle('open');
+            header.setAttribute('aria-expanded', nowOpen ? 'true' : 'false');
+            if (!normFilter) {
+                if (nowOpen) expandedDepts.add(dept);
+                else expandedDepts.delete(dept);
+            }
         });
         header.addEventListener('keydown', e => {
             if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); header.click(); }
@@ -454,30 +599,32 @@ function renderCourseList(filter = '') {
         const levelCourses = document.createElement('div');
         levelCourses.className = 'level-courses';
 
-        courses.forEach(name => {
-            const sectionsInDept = coursesByName[name].filter(s => getDept(s) === dept);
-            const openCount = sectionsInDept.filter(s => !isClosedSection(s)).length;
-            const isSelected = selectedCourses.has(name);
+        courseKeys.forEach(key => {
+            const meta = courseMetaByKey[key];
+            const sections = coursesByKey[key] || [];
+            const openCount = sections.filter(s => !isClosedSection(s)).length;
+            const isSelected = selectedCourses.has(key);
             const noOpen = userPrefs.openOnly && openCount === 0;
 
             const item = document.createElement('div');
             item.className = 'course-item' + (isSelected ? ' selected' : '') + (noOpen ? ' all-closed' : '');
-            item.dataset.courseName = name;
+            item.dataset.courseKey = key;
             item.setAttribute('tabindex', '0');
             item.setAttribute('role', 'checkbox');
             item.setAttribute('aria-checked', isSelected ? 'true' : 'false');
 
             const countText = userPrefs.openOnly
-                ? `${openCount}/${sectionsInDept.length} متاحة`
-                : `${sectionsInDept.length} شعب`;
+                ? `${openCount}/${sections.length} متاحة`
+                : `${sections.length} شعب`;
 
             item.innerHTML = `
                 <span class="custom-checkbox" aria-hidden="true"></span>
-                <span class="course-name">${esc(name)}</span>
+                <span class="course-name">${esc(meta.name)}</span>
+                ${meta.code ? `<span class="course-code">${esc(meta.code)}</span>` : ''}
                 <span class="course-sections-count">${esc(countText)}</span>`;
-            item.addEventListener('click', () => toggleCourse(item, name));
+            item.addEventListener('click', () => toggleCourse(item, key));
             item.addEventListener('keydown', e => {
-                if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleCourse(item, name); }
+                if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleCourse(item, key); }
             });
             levelCourses.appendChild(item);
         });
@@ -492,6 +639,7 @@ function renderCourseList(filter = '') {
         return;
     }
     container.appendChild(fragment);
+    container.scrollTop = prevScrollTop;
 }
 
 function updateSelectedCountUI() {
@@ -505,22 +653,31 @@ function updateSelectedCountUI() {
     document.getElementById('btnGenerate').disabled = count === 0;
 }
 
-function toggleCourse(el, courseName) {
-    if (selectedCourses.has(courseName)) {
-        selectedCourses.delete(courseName);
-        el.classList.remove('selected');
-        el.setAttribute('aria-checked', 'false');
+function syncCourseCheckboxDOM(courseKey, isSelected) {
+    document.querySelectorAll('.course-item').forEach(node => {
+        if (node.dataset.courseKey === courseKey) {
+            node.classList.toggle('selected', isSelected);
+            node.setAttribute('aria-checked', isSelected ? 'true' : 'false');
+        }
+    });
+}
+
+function toggleCourse(el, courseKey) {
+    const willSelect = !selectedCourses.has(courseKey);
+    if (willSelect) {
+        selectedCourses.add(courseKey);
     } else {
-        selectedCourses.add(courseName);
-        el.classList.add('selected');
-        el.setAttribute('aria-checked', 'true');
+        selectedCourses.delete(courseKey);
     }
+    resultsStale = true;
+    syncCourseCheckboxDOM(courseKey, willSelect);
     updateSelectedCountUI();
     renderSelectedPanel();
     saveSelectionsToStorage();
 }
 
 function resetResultsToEmpty() {
+    resultsStale = false;
     document.getElementById('resultsArea').innerHTML = `
         <div class="empty-state" id="emptyState">
             <div class="empty-icon">
@@ -535,12 +692,15 @@ function resetResultsToEmpty() {
 }
 
 function clearSelections() {
+    stopScheduleWorker();
     selectedCourses.clear();
     currentSchedules = [];
     lastSortedSchedules = [];
     lastTotalFound = 0;
     lastWasCapped = false;
+    lastStoppedEarly = false;
     lastConflicts = [];
+    lastConflictTuples = [];
     lastConflictReason = '';
     lastFilteredOutCourses = [];
     updateSelectedCountUI();
@@ -559,25 +719,29 @@ function renderSelectedPanel() {
         return;
     }
     container.innerHTML = '';
-    [...selectedCourses].forEach(name => {
+    [...selectedCourses].forEach(key => {
+        const meta = courseMetaByKey[key];
+        const label = meta ? (meta.code ? `${meta.name} (${meta.code})` : meta.name) : key;
         const span = document.createElement('span');
         span.className = 'selected-tag';
-        span.appendChild(document.createTextNode(name));
-        const removeBtn = document.createElement('span');
+        span.appendChild(document.createTextNode(label));
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
         removeBtn.className = 'selected-tag-remove';
         removeBtn.textContent = '×';
-        removeBtn.setAttribute('role', 'button');
-        removeBtn.setAttribute('aria-label', `إزالة ${name}`);
-        removeBtn.addEventListener('click', () => removeCourse(name));
+        removeBtn.setAttribute('aria-label', `إزالة ${label}`);
+        removeBtn.addEventListener('click', () => removeCourse(key));
         span.appendChild(removeBtn);
         container.appendChild(span);
     });
 }
 
-function removeCourse(name) {
-    selectedCourses.delete(name);
+function removeCourse(key) {
+    selectedCourses.delete(key);
+    resultsStale = true;
     updateSelectedCountUI();
-    renderCourseList(document.getElementById('searchInput').value.trim());
+    syncCourseCheckboxDOM(key, false);
     renderSelectedPanel();
     saveSelectionsToStorage();
 }
@@ -586,7 +750,8 @@ function removeCourse(name) {
 function generateSchedules() {
     if (selectedCourses.size === 0) return;
 
-    if (scheduleWorker) scheduleWorker.terminate();
+    stopScheduleWorker();
+    resultsStale = false;
 
     const resultsArea = document.getElementById('resultsArea');
     resultsArea.innerHTML = `
@@ -609,10 +774,11 @@ function generateSchedules() {
     const seenCourseKey = new Set();
     let errorCourseName = '';
 
-    for (const courseName of selectedCourses) {
-        const allSecs = coursesByName[courseName];
+    for (const courseKey of selectedCourses) {
+        const allSecs = coursesByKey[courseKey];
+        const meta = courseMetaByKey[courseKey];
         if (!allSecs || allSecs.length === 0) {
-            errorCourseName = courseName;
+            errorCourseName = meta?.name || courseKey;
             break;
         }
         const sections = [];
@@ -621,13 +787,13 @@ function generateSchedules() {
             const k = getSectionKey(s);
             if (!seenSec.has(k)) {
                 seenSec.add(k);
-                s._courseName = courseName;
+                s._courseName = meta?.name || getCourseName(s);
                 sections.push(s);
             }
         });
-        const courseKey = sections.map(getSectionKey).sort().join('<>');
-        if (seenCourseKey.has(courseKey)) continue;
-        seenCourseKey.add(courseKey);
+        const sigKey = [courseKey, sections.map(getSectionKey).sort().join('<>')].join('::');
+        if (seenCourseKey.has(sigKey)) continue;
+        seenCourseKey.add(sigKey);
         coursesSections.push(sections);
     }
 
@@ -644,7 +810,7 @@ function generateSchedules() {
     const btnGenerate = document.getElementById('btnGenerate');
     btnGenerate.disabled = true;
 
-    scheduleWorker = new Worker('./worker.js?v=3');
+    scheduleWorker = new Worker('./worker.js?v=4');
     scheduleWorker.postMessage({
         coursesSections,
         options: {
@@ -661,7 +827,9 @@ function generateSchedules() {
             validSchedules,
             totalFound,
             wasCapped,
+            stoppedEarly,
             incompatiblePairs,
+            incompatiblePairTuples,
             conflictReason,
             filteredOutCourses
         } = e.data;
@@ -673,14 +841,14 @@ function generateSchedules() {
         currentSchedules = lastSortedSchedules.map(item => item.schedule);
         lastTotalFound = totalFound || currentSchedules.length;
         lastWasCapped = Boolean(wasCapped);
+        lastStoppedEarly = Boolean(stoppedEarly);
         lastConflicts = incompatiblePairs || [];
+        lastConflictTuples = incompatiblePairTuples || [];
         lastConflictReason = conflictReason || '';
         lastFilteredOutCourses = filteredOutCourses || [];
         currentPage = 1;
         renderResults();
-        scheduleWorker.terminate();
-        scheduleWorker = null;
-        btnGenerate.disabled = selectedCourses.size === 0;
+        stopScheduleWorker();
     };
 
     scheduleWorker.onerror = function (err) {
@@ -691,16 +859,14 @@ function generateSchedules() {
                 <h3>حدث خطأ أثناء المعالجة</h3>
                 <p>يرجى المحاولة مجدداً.</p>
             </div>`;
-        scheduleWorker.terminate();
-        scheduleWorker = null;
-        btnGenerate.disabled = selectedCourses.size === 0;
+        stopScheduleWorker();
     };
 }
 
 // =================== Formatters ===================
 function formatLecturers(raw) {
     if (!raw) return '—';
-    const s = raw
+    const s = String(raw)
         .replace(/<br\s*\/?>/gi, ' || ')
         .replace(/<[^>]*>/g, ' ')
         .replace(/\s+/g, ' ')
@@ -708,7 +874,7 @@ function formatLecturers(raw) {
     if (!s) return '—';
 
     if (s.includes('||')) {
-        return s.split('||').map(n => n.trim()).filter(Boolean).join(' || ');
+        return s.split('||').map(n => n.trim()).filter(Boolean).join(' || ') || '—';
     }
 
     const parts = s.split(/\s+(?=(?:أ\.د\.|د\.|أ\.|م\.)\s)/u).map(p => p.trim()).filter(Boolean);
@@ -718,9 +884,14 @@ function formatLecturers(raw) {
 
 function formatRooms(raw) {
     if (!raw) return '—';
-    const s = String(raw).replace(/\s+/g, ' ').trim();
-    if (!s) return '—';
-    return s;
+    const tokens = String(raw)
+        .replace(/<br\s*\/?>/gi, ' || ')
+        .replace(/<[^>]*>/g, ' ')
+        .split(/\s*(?:\|\||\/)\s*/)
+        .map(t => t.replace(/\s+/g, ' ').trim())
+        .filter(t => t !== '' && !/^null$/i.test(t));
+    if (tokens.length === 0) return '—';
+    return [...new Set(tokens)].join(' / ');
 }
 
 function getScheduleCredits(schedule) {
@@ -747,16 +918,26 @@ function renderResults() {
                     </ul>
                     <p class="conflict-hint">* جرّب إلغاء تفعيل "الشعب المتاحة فقط" أو تقليل الأيام المستثناة.</p>
                 </div>`;
-        } else if (lastConflicts && lastConflicts.length > 0) {
+        } else if (lastConflictTuples.length > 0 || (lastConflicts && lastConflicts.length > 0)) {
+            const pairs = lastConflictTuples.length > 0
+                ? lastConflictTuples
+                : lastConflicts.map(pair => pair.split(' | '));
             conflictHtml = `
                 <div class="conflict-details">
                     <h4>التعارضات التي منعت توليد الجداول:</h4>
                     <ul>
-                        ${lastConflicts.map(pair => `
-                            <li>* تعارض بين <strong>${esc(pair.split(' | ')[0])}</strong> و <strong>${esc(pair.split(' | ')[1])}</strong></li>
+                        ${pairs.map(([a, b]) => `
+                            <li>* تعارض بين <strong>${esc(a)}</strong> و <strong>${esc(b || '')}</strong></li>
                         `).join('')}
                     </ul>
                     <p class="conflict-hint">* يرجى إزالة أو تغيير إحدى هذه المواد والمحاولة مرة أخرى.</p>
+                </div>`;
+        } else if (lastConflictReason === 'timeout') {
+            headline = 'استغرق البحث وقتاً أطول من الحد المسموح دون العثور على جدول متوافق.';
+            conflictHtml = `
+                <div class="conflict-details">
+                    <h4>تعذّر إكمال البحث ضمن المهلة الزمنية:</h4>
+                    <p class="conflict-hint">* عدد التوليفات كبير جداً أو متعارض؛ جرّب تقليل عدد المواد أو تفعيل "الشعب المتاحة فقط".</p>
                 </div>`;
         } else if (lastConflictReason === 'multi_way') {
             headline = 'لا يوجد تعارض ثنائي مباشر، لكن 3 مواد أو أكثر تتقاطع معاً في جميع التوليفات الممكنة.';
@@ -787,8 +968,9 @@ function renderResults() {
 
     const header = document.createElement('div');
     header.className = 'results-header';
+    const plusSuffix = lastStoppedEarly ? '+' : '';
     const countText = lastWasCapped
-        ? `عرض أفضل <strong>${scored.length}</strong> من أصل <strong>${lastTotalFound}</strong>+ جدول`
+        ? `عرض أفضل <strong>${scored.length}</strong> من أصل <strong>${lastTotalFound}${plusSuffix}</strong> جدول`
         : `تم العثور على <strong>${scored.length}</strong> جدول`;
     header.innerHTML = `
         <h2 class="results-title">الجداول المقترحة</h2>
@@ -798,7 +980,7 @@ function renderResults() {
     if (lastWasCapped) {
         const capWarn = document.createElement('div');
         capWarn.className = 'cap-warning';
-        capWarn.textContent = `عدد التوليفات الممكنة كبير (${lastTotalFound}+) — يتم عرض أفضل ${scored.length} جدول حسب معيار الترتيب المختار.`;
+        capWarn.textContent = `عدد التوليفات الممكنة كبير (${lastTotalFound}${plusSuffix}) — يتم عرض أفضل ${scored.length} جدول حسب معيار الترتيب المختار.`;
         wrapper.appendChild(capWarn);
     }
 
@@ -810,13 +992,17 @@ function renderResults() {
             : breakHours > 0 ? `${breakHours}س ${breakMins}د` : `${breakMins}د`;
         const totalCredits = getScheduleCredits(schedule);
         const isTop = globalRank <= 3;
+        const isInitiallyOpen = idx === 0;
 
         const card = document.createElement('div');
-        card.className = 'schedule-card' + (idx === 0 ? ' open' : '');
+        card.className = 'schedule-card' + (isInitiallyOpen ? ' open' : '');
         if (isTop && globalRank === 1) card.classList.add('rank-one-card');
 
         const cardHeader = document.createElement('div');
         cardHeader.className = 'card-header';
+        cardHeader.setAttribute('tabindex', '0');
+        cardHeader.setAttribute('role', 'button');
+        cardHeader.setAttribute('aria-expanded', isInitiallyOpen ? 'true' : 'false');
         cardHeader.innerHTML = `
             <div class="card-header-meta">
                 <div class="card-header-right">
@@ -832,16 +1018,28 @@ function renderResults() {
                         ${isTop ? `<span class="score-badge rank-best">${globalRank === 1 ? 'الأفضل' : globalRank === 2 ? 'ممتاز' : 'جيد جداً'}</span>` : ''}
                     </div>
                     <div class="card-actions" data-html2canvas-ignore="true">
-                        <button class="btn-calendar" data-rank="${globalRank}">تقويم</button>
-                        <button class="btn-export" data-rank="${globalRank}">تصدير</button>
+                        <button type="button" class="btn-calendar" data-rank="${globalRank}" aria-expanded="false" aria-controls="calendar-${globalRank}">تقويم</button>
+                        <button type="button" class="btn-export" data-rank="${globalRank}">تصدير</button>
                     </div>
-                    <span class="card-expand-icon" data-html2canvas-ignore="true">▼</span>
+                    <span class="card-expand-icon" data-html2canvas-ignore="true" aria-hidden="true">▼</span>
                 </div>
             </div>`;
 
+        const toggleCardOpen = () => {
+            const open = card.classList.toggle('open');
+            cardHeader.setAttribute('aria-expanded', open ? 'true' : 'false');
+        };
+
         cardHeader.addEventListener('click', e => {
             if (e.target.closest('button')) return;
-            card.classList.toggle('open');
+            toggleCardOpen();
+        });
+        cardHeader.addEventListener('keydown', e => {
+            if (e.target.closest('button')) return;
+            if (e.key === ' ' || e.key === 'Enter') {
+                e.preventDefault();
+                toggleCardOpen();
+            }
         });
 
         const cardBody = document.createElement('div');
@@ -855,16 +1053,26 @@ function renderResults() {
         schedule.forEach(section => {
             const row = document.createElement('div');
             row.className = 'section-row';
-            const online = isOnlineSection(section);
+            const mode = getSectionMode(section);
             const closed = isClosedSection(section);
-            const modeBadgeClass = online ? 'mode-badge online' : 'mode-badge onsite';
-            const modeLabel = online ? 'أونلاين' : 'وجاهي';
+            const modeBadgeClass = mode === 'online'
+                ? 'mode-badge online'
+                : mode === 'blended'
+                    ? 'mode-badge blended'
+                    : 'mode-badge onsite';
+            const modeLabel = mode === 'online'
+                ? 'أونلاين'
+                : mode === 'blended'
+                    ? 'مدمج'
+                    : 'وجاهي';
             const closedBadge = closed ? '<span class="mode-badge closed">مغلقة</span>' : '';
+            const courseName = getCourseName(section) || String(section['اسم المادة'] || '').trim();
+            const courseCode = getCourseCode(section);
             row.innerHTML = `
-                <span class="section-course-name">${esc(section['اسم المادة'])}</span>
+                <span class="section-course-name">${esc(courseName)}${courseCode ? `<span class="section-course-code">${esc(courseCode)}</span>` : ''}</span>
                 <span class="section-num" data-label="الشعبة">${esc(section['ش.'])}</span>
                 <span class="section-hours" data-label="الساعات">${esc(section['س.'] || '—')}</span>
-                <span class="section-time" data-label="الوقت">${formatTimeSlotsHTML(section, online)}</span>
+                <span class="section-time" data-label="الوقت">${formatTimeSlotsHTML(section)}</span>
                 <span class="section-room" data-label="القاعة">${esc(formatRooms(section['القاعات']))}</span>
                 <span class="section-instructor" data-label="المحاضر">${esc(formatLecturers(section['المحاضرين']))}</span>
                 <span class="section-mode" data-label="النمط"><span class="${modeBadgeClass}">${modeLabel}</span>${closedBadge}</span>`;
@@ -897,6 +1105,7 @@ function renderResults() {
         pagination.className = 'pagination';
 
         const prevBtn = document.createElement('button');
+        prevBtn.type = 'button';
         prevBtn.className = 'page-btn';
         prevBtn.textContent = '◀ السابق';
         prevBtn.disabled = currentPage === 1;
@@ -908,6 +1117,7 @@ function renderResults() {
             if (totalPages <= 7 || p === 1 || p === totalPages || Math.abs(p - currentPage) <= 1) {
                 lastWasDots = false;
                 const btn = document.createElement('button');
+                btn.type = 'button';
                 btn.className = 'page-btn' + (p === currentPage ? ' active' : '');
                 btn.textContent = p;
                 btn.addEventListener('click', () => goToPage(p));
@@ -915,6 +1125,7 @@ function renderResults() {
             } else if (!lastWasDots) {
                 lastWasDots = true;
                 const dots = document.createElement('button');
+                dots.type = 'button';
                 dots.className = 'page-btn';
                 dots.textContent = '...';
                 dots.disabled = true;
@@ -923,6 +1134,7 @@ function renderResults() {
         }
 
         const nextBtn = document.createElement('button');
+        nextBtn.type = 'button';
         nextBtn.className = 'page-btn';
         nextBtn.textContent = 'التالي ▶';
         nextBtn.disabled = currentPage === totalPages;
@@ -947,41 +1159,57 @@ function goToPage(page) {
 const SLOT_START = 8 * 60;
 const SLOT_END = 20 * 60;
 const SLOT_SIZE = 30;
-const COLORS = ['#0f8f4d', '#2563eb', '#9333ea', '#ea580c', '#0891b2', '#65a30d', '#be185d', '#ca8a04'];
-
-function formatMinutes12(mins) {
-    const h24 = Math.floor(mins / 60);
-    const mm = String(mins % 60).padStart(2, '0');
-    const period = h24 >= 12 ? 'م' : 'ص';
-    const h12 = h24 > 12 ? h24 - 12 : (h24 === 0 ? 12 : h24);
-    return `${h12}:${mm} ${period}`;
-}
+const COLORS = ['#0b7a41', '#1d4ed8', '#7e22ce', '#c2410c', '#0e7490', '#4d7c0f', '#be185d', '#a16207'];
 
 function toggleCalendar(btn, schedule, rank) {
     const panel = document.getElementById(`calendar-${rank}`);
     const card = btn.closest('.schedule-card');
-    if (!card.classList.contains('open')) card.classList.add('open');
+    const cardHeader = card.querySelector('.card-header');
+    if (!card.classList.contains('open')) {
+        card.classList.add('open');
+        if (cardHeader) cardHeader.setAttribute('aria-expanded', 'true');
+    }
     if (panel.style.display !== 'none') {
         panel.style.display = 'none';
         btn.textContent = 'تقويم';
+        btn.setAttribute('aria-expanded', 'false');
         return;
     }
     panel.style.display = 'block';
     renderCalendar(panel, schedule);
     btn.textContent = 'إخفاء التقويم';
+    btn.setAttribute('aria-expanded', 'true');
 }
 
 function renderCalendar(panel, schedule) {
-    const slots = Math.ceil((SLOT_END - SLOT_START) / SLOT_SIZE);
+    let minStart = SLOT_START;
+    let maxEnd = SLOT_END;
+    let hasFriday = false;
+
+    schedule.forEach(section => {
+        (section._parsedSlots || []).forEach(slot => {
+            if (slot.start > 0 && slot.start < minStart) minStart = slot.start;
+            if (slot.end > maxEnd) maxEnd = slot.end;
+            if ((slot.days || []).includes('ج')) hasFriday = true;
+        });
+    });
+
+    const calStart = Math.floor(minStart / SLOT_SIZE) * SLOT_SIZE;
+    const calEnd = Math.ceil(maxEnd / SLOT_SIZE) * SLOT_SIZE;
+    const slots = Math.ceil((calEnd - calStart) / SLOT_SIZE);
+    const calDays = hasFriday ? [...CALENDAR_DAY_ORDER, 'ج'] : CALENDAR_DAY_ORDER;
+
     const grid = document.createElement('div');
     grid.className = 'calendar-grid';
+    grid.style.gridTemplateColumns = `66px repeat(${calDays.length}, minmax(80px, 1fr))`;
+    grid.style.gridTemplateRows = `30px repeat(${slots}, 30px)`;
 
     const emptyHeader = document.createElement('div');
     emptyHeader.className = 'cal-header';
     emptyHeader.style.gridRow = '1';
     emptyHeader.style.gridColumn = '1';
     grid.appendChild(emptyHeader);
-    CALENDAR_DAY_ORDER.forEach((d, dIdx) => {
+    calDays.forEach((d, dIdx) => {
         const h = document.createElement('div');
         h.className = 'cal-header';
         h.textContent = DAY_FULL[d] || d;
@@ -992,18 +1220,14 @@ function renderCalendar(panel, schedule) {
 
     for (let i = 0; i < slots; i++) {
         const rowNum = String(i + 2);
-        const mins = SLOT_START + i * SLOT_SIZE;
-        const h24 = Math.floor(mins / 60);
-        const mm = String(mins % 60).padStart(2, '0');
-        const period = h24 >= 12 ? 'م' : 'ص';
-        const h12 = h24 > 12 ? h24 - 12 : (h24 === 0 ? 12 : h24);
+        const mins = calStart + i * SLOT_SIZE;
         const timeCell = document.createElement('div');
         timeCell.className = 'cal-time';
-        timeCell.textContent = `${h12}:${mm} ${period}`;
+        timeCell.textContent = formatMinutes12(mins);
         timeCell.style.gridRow = rowNum;
         timeCell.style.gridColumn = '1';
         grid.appendChild(timeCell);
-        CALENDAR_DAY_ORDER.forEach((_, dIdx) => {
+        calDays.forEach((_, dIdx) => {
             const cell = document.createElement('div');
             cell.className = 'cal-cell';
             cell.style.gridRow = rowNum;
@@ -1016,6 +1240,7 @@ function renderCalendar(panel, schedule) {
         const parsedSlots = section._parsedSlots;
         if (!parsedSlots || parsedSlots.length === 0) return;
         const color = COLORS[sIdx % COLORS.length];
+        const courseName = getCourseName(section) || String(section['اسم المادة'] || '').trim();
 
         const byDay = {};
         parsedSlots.forEach(t => {
@@ -1026,12 +1251,12 @@ function renderCalendar(panel, schedule) {
         });
 
         Object.entries(byDay).forEach(([day, intervals]) => {
-            const dayIdx = CALENDAR_DAY_ORDER.indexOf(day);
+            const dayIdx = calDays.indexOf(day);
             if (dayIdx === -1) return;
 
             mergeDayIntervals(intervals).forEach(interval => {
-                const exactStart = Math.max(0, (interval.start - SLOT_START) / SLOT_SIZE);
-                const exactEnd = Math.min(slots, (interval.end - SLOT_START) / SLOT_SIZE);
+                const exactStart = Math.max(0, (interval.start - calStart) / SLOT_SIZE);
+                const exactEnd = Math.min(slots, (interval.end - calStart) / SLOT_SIZE);
                 if (exactStart >= slots || exactEnd <= 0 || exactEnd <= exactStart) return;
 
                 const firstSlot = Math.floor(exactStart);
@@ -1044,11 +1269,11 @@ function renderCalendar(panel, schedule) {
                 const event = document.createElement('div');
                 event.className = 'cal-event';
                 const timeRangeText = `${formatMinutes12(interval.start)} – ${formatMinutes12(interval.end)}`;
-                event.title = `${section['اسم المادة']} (${timeRangeText})`;
+                event.title = `${courseName} (${timeRangeText})`;
 
                 const titleEl = document.createElement('span');
                 titleEl.className = 'cal-event-title';
-                titleEl.textContent = section['اسم المادة'] || '';
+                titleEl.textContent = courseName;
 
                 const timeEl = document.createElement('span');
                 timeEl.className = 'cal-event-time';
@@ -1081,23 +1306,19 @@ async function exportSchedule(cardElement, rank, btnElement) {
         return;
     }
 
+    const wasOpen = cardElement.classList.contains('open');
+    const scrollWrap = cardElement.querySelector('.calendar-scroll-wrap');
+    const oldOverflow = scrollWrap ? scrollWrap.style.overflowX : '';
+    const isMobile = window.innerWidth <= 768;
+    const oldWidth = cardElement.style.width;
+    const oldMaxWidth = cardElement.style.maxWidth;
+
     try {
         btnElement.textContent = 'جاري التصدير...';
         btnElement.disabled = true;
 
-        const wasOpen = cardElement.classList.contains('open');
         if (!wasOpen) cardElement.classList.add('open');
-
-        const scrollWrap = cardElement.querySelector('.calendar-scroll-wrap');
-        let oldOverflow = '';
-        if (scrollWrap) {
-            oldOverflow = scrollWrap.style.overflowX;
-            scrollWrap.style.overflowX = 'visible';
-        }
-
-        const isMobile = window.innerWidth <= 768;
-        const oldWidth = cardElement.style.width;
-        const oldMaxWidth = cardElement.style.maxWidth;
+        if (scrollWrap) scrollWrap.style.overflowX = 'visible';
         if (isMobile) {
             cardElement.style.width = '1024px';
             cardElement.style.maxWidth = '1024px';
@@ -1113,15 +1334,6 @@ async function exportSchedule(cardElement, rank, btnElement) {
             width: isMobile ? 1024 : undefined
         });
 
-        if (isMobile) {
-            cardElement.style.width = oldWidth;
-            cardElement.style.maxWidth = oldMaxWidth;
-        }
-        if (scrollWrap) {
-            scrollWrap.style.overflowX = oldOverflow;
-        }
-        if (!wasOpen) cardElement.classList.remove('open');
-
         const imgData = canvas.toDataURL('image/png');
         const a = document.createElement('a');
         a.href = imgData;
@@ -1135,6 +1347,14 @@ async function exportSchedule(cardElement, rank, btnElement) {
         console.error('Error exporting image:', err);
         showToast('حدث خطأ أثناء تصدير الصورة');
     } finally {
+        if (isMobile) {
+            cardElement.style.width = oldWidth;
+            cardElement.style.maxWidth = oldMaxWidth;
+        }
+        if (scrollWrap) {
+            scrollWrap.style.overflowX = oldOverflow;
+        }
+        if (!wasOpen) cardElement.classList.remove('open');
         btnElement.textContent = 'تصدير';
         btnElement.disabled = false;
     }
@@ -1153,8 +1373,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const openOnlyToggle = document.getElementById('openOnlyToggle');
     const excludedDaysGroup = document.getElementById('excludedDaysGroup');
 
-    if (currentServer) serverSelect.value = currentServer;
-    if (currentDegree) degreeSelect.value = currentDegree;
+    if (currentServer && [...serverSelect.options].some(o => o.value === currentServer)) {
+        serverSelect.value = currentServer;
+    } else {
+        currentServer = '';
+    }
+    if (currentDegree && [...degreeSelect.options].some(o => o.value === currentDegree)) {
+        degreeSelect.value = currentDegree;
+    } else {
+        currentDegree = '';
+    }
     if (sortModeSelect) sortModeSelect.value = userPrefs.sortMode;
     if (openOnlyToggle) openOnlyToggle.checked = userPrefs.openOnly;
 
@@ -1168,26 +1396,25 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function checkDropdowns() {
+    function checkDropdowns(skipPreload = false) {
         if (serverSelect.value === 'center') {
             subCollegeContainer.classList.add('visible');
-            preloadSubColleges(degreeSelect.value);
+            if (!skipPreload) preloadSubColleges(degreeSelect.value);
         } else {
             subCollegeContainer.classList.remove('visible');
             subCollegeSelect.value = '';
-            currentSubCollege = '';
         }
         updateDegreeAvailability();
     }
 
-    serverSelect.addEventListener('change', checkDropdowns);
+    serverSelect.addEventListener('change', () => checkDropdowns(false));
     degreeSelect.addEventListener('change', () => {
         btnLoadData.disabled = !serverSelect.value || !degreeSelect.value;
         if (serverSelect.value === 'center') {
             preloadSubColleges(degreeSelect.value);
         }
     });
-    checkDropdowns();
+    checkDropdowns(Boolean(currentServer === 'center' && currentDegree));
 
     subCollegeSelect.addEventListener('change', () => {
         currentSubCollege = subCollegeSelect.value;
@@ -1199,7 +1426,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     btnLoadData.addEventListener('click', () => {
-        if (currentServer !== serverSelect.value || currentDegree !== degreeSelect.value) {
+        const switchingSource = currentServer !== serverSelect.value || currentDegree !== degreeSelect.value;
+        if (switchingSource) {
+            stopScheduleWorker();
+            currentLastUpdate = null;
             currentServer = serverSelect.value;
             currentDegree = degreeSelect.value;
             if (currentServer === 'center') {
@@ -1213,7 +1443,9 @@ document.addEventListener('DOMContentLoaded', () => {
             lastSortedSchedules = [];
             lastTotalFound = 0;
             lastWasCapped = false;
+            lastStoppedEarly = false;
             lastConflicts = [];
+            lastConflictTuples = [];
             lastConflictReason = '';
             lastFilteredOutCourses = [];
             saveSelectionsToStorage();
@@ -1227,9 +1459,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function handlePrefsChange(sortOnly) {
         saveSelectionsToStorage();
-        renderCourseList(document.getElementById('searchInput').value.trim());
+        if (!sortOnly) {
+            renderCourseList(document.getElementById('searchInput').value.trim());
+        }
         if (selectedCourses.size > 0 && (currentSchedules.length > 0 || lastConflictReason)) {
-            if (sortOnly && !lastWasCapped && lastSortedSchedules.length > 0) {
+            if (sortOnly && !resultsStale && !lastWasCapped && lastSortedSchedules.length > 0) {
                 lastSortedSchedules = lastSortedSchedules.map(item => ({
                     schedule: item.schedule,
                     score: scoreSchedule(item.schedule, userPrefs.sortMode)
