@@ -3,6 +3,7 @@
 A web application for **Balqa Applied University (BAU)** students to build conflict-free course schedules across all university colleges and campuses, featuring a vintage Windows 95 interface, Web Worker constraint solving, weekly calendar visualization, and PNG schedule export.
 
 **Author:** Mosa Akram ([LinkedIn](https://www.linkedin.com/in/mosakrm/))
+**Live-Demo:** https://bau-scheduler0.web.app/
 
 ---
 
