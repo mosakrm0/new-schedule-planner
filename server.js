@@ -42,9 +42,10 @@ app.use(express.static(path.join(__dirname, 'public'), {
     etag: true,
     lastModified: true,
     setHeaders(res, filePath) {
-        if (path.basename(filePath) === 'index.html') {
+        const ext = path.extname(filePath).toLowerCase();
+        if (ext === '.html' || ext === '.js' || ext === '.css') {
             res.setHeader('Cache-Control', 'no-cache');
-        } else if (filePath.endsWith('.csv') || filePath.endsWith('.json')) {
+        } else if (ext === '.csv' || ext === '.json') {
             res.setHeader('Cache-Control', 'public, max-age=300');
         } else if (/\.(jpg|jpeg|png|gif|webp|woff2?)$/.test(filePath)) {
             res.setHeader('Cache-Control', 'public, max-age=86400, immutable');

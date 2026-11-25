@@ -1,4 +1,4 @@
-importScripts('./schedule-core.js');
+importScripts('./schedule-core.js?v=3');
 
 self.onmessage = function (e) {
     const { coursesSections, options } = e.data || {};

@@ -8,6 +8,7 @@ const {
     isClosedSection,
     parseMultiSlots,
     parseSectionSlots,
+    mergeDayIntervals,
     scoreSchedule
 } = window.ScheduleCore;
 
@@ -169,31 +170,71 @@ function getTotalSelectedCredits() {
     return total;
 }
 
-function populateSubColleges(rawSections) {
+const subCollegeCache = {};
+
+function populateSubCollegeOptions(sortedColleges) {
     const subCollegeSelect = document.getElementById('subCollegeSelect');
     if (!subCollegeSelect) return;
 
-    const colleges = new Set();
-    rawSections.forEach(s => {
-        const c = (s['الكلية'] || '').trim();
-        if (c && c !== 'عام') colleges.add(c);
-    });
-
-    const sorted = [...colleges].sort((a, b) => a.localeCompare(b, 'ar'));
+    const preferred = subCollegeSelect.value || currentSubCollege;
     subCollegeSelect.innerHTML = '<option value="">الكلية (الجميع)</option>';
-    sorted.forEach(c => {
+    sortedColleges.forEach(c => {
         const opt = document.createElement('option');
         opt.value = c;
         opt.textContent = c;
         subCollegeSelect.appendChild(opt);
     });
 
-    const optExists = [...subCollegeSelect.options].some(o => o.value === currentSubCollege);
+    const optExists = [...subCollegeSelect.options].some(o => o.value === preferred);
     if (optExists) {
-        subCollegeSelect.value = currentSubCollege;
+        subCollegeSelect.value = preferred;
+        currentSubCollege = preferred;
     } else {
         subCollegeSelect.value = '';
         currentSubCollege = '';
+    }
+}
+
+function populateSubColleges(rawSections) {
+    const colleges = new Set();
+    rawSections.forEach(s => {
+        const c = (s['الكلية'] || '').trim();
+        if (c && c !== 'عام') colleges.add(c);
+    });
+    const sorted = [...colleges].sort((a, b) => a.localeCompare(b, 'ar'));
+    populateSubCollegeOptions(sorted);
+}
+
+async function preloadSubColleges(degree) {
+    if (typeof Papa === 'undefined') return;
+    const targetDeg = (degree === '2' || degree === '3') ? degree : '3';
+    if (subCollegeCache[targetDeg]) {
+        populateSubCollegeOptions(subCollegeCache[targetDeg]);
+        return;
+    }
+
+    const candidates = (degree === '2' || degree === '3') ? [degree] : ['3', '2'];
+    for (const deg of candidates) {
+        try {
+            const res = await fetch(`data/center_${deg}.csv`);
+            if (!res.ok) continue;
+            let text = await res.text();
+            text = text.replace(/^\uFEFF/, '');
+            const parsed = Papa.parse(text, { header: true, skipEmptyLines: true, dynamicTyping: false });
+            const colleges = new Set();
+            (parsed.data || []).forEach(raw => {
+                const row = normalizeCSVRow(raw);
+                const c = (row['الكلية'] || '').trim();
+                if (c && c !== 'عام') colleges.add(c);
+            });
+            const sorted = [...colleges].sort((a, b) => a.localeCompare(b, 'ar'));
+            subCollegeCache[deg] = sorted;
+            const serverSelect = document.getElementById('serverSelect');
+            if (serverSelect && serverSelect.value === 'center') {
+                populateSubCollegeOptions(sorted);
+            }
+            return;
+        } catch (_) { /* ignore and try next candidate */ }
     }
 }
 
@@ -603,7 +644,7 @@ function generateSchedules() {
     const btnGenerate = document.getElementById('btnGenerate');
     btnGenerate.disabled = true;
 
-    scheduleWorker = new Worker('./worker.js');
+    scheduleWorker = new Worker('./worker.js?v=3');
     scheduleWorker.postMessage({
         coursesSections,
         options: {
@@ -786,6 +827,7 @@ function renderResults() {
                     <div class="score-badges">
                         <span class="score-badge days">${score.days} ${score.days === 1 ? 'يوم' : 'أيام'}</span>
                         <span class="score-badge breaks">${esc(breakLabel)}</span>
+                        ${score.earliest > 0 && score.latest > 0 ? `<span class="score-badge time-window">${esc(formatMinutes12(score.earliest))} – ${esc(formatMinutes12(score.latest))}</span>` : ''}
                         <span class="score-badge credits">${totalCredits} ساعة</span>
                         ${isTop ? `<span class="score-badge rank-best">${globalRank === 1 ? 'الأفضل' : globalRank === 2 ? 'ممتاز' : 'جيد جداً'}</span>` : ''}
                     </div>
@@ -907,6 +949,14 @@ const SLOT_END = 20 * 60;
 const SLOT_SIZE = 30;
 const COLORS = ['#0f8f4d', '#2563eb', '#9333ea', '#ea580c', '#0891b2', '#65a30d', '#be185d', '#ca8a04'];
 
+function formatMinutes12(mins) {
+    const h24 = Math.floor(mins / 60);
+    const mm = String(mins % 60).padStart(2, '0');
+    const period = h24 >= 12 ? 'م' : 'ص';
+    const h12 = h24 > 12 ? h24 - 12 : (h24 === 0 ? 12 : h24);
+    return `${h12}:${mm} ${period}`;
+}
+
 function toggleCalendar(btn, schedule, rank) {
     const panel = document.getElementById(`calendar-${rank}`);
     const card = btn.closest('.schedule-card');
@@ -928,15 +978,20 @@ function renderCalendar(panel, schedule) {
 
     const emptyHeader = document.createElement('div');
     emptyHeader.className = 'cal-header';
+    emptyHeader.style.gridRow = '1';
+    emptyHeader.style.gridColumn = '1';
     grid.appendChild(emptyHeader);
-    CALENDAR_DAY_ORDER.forEach(d => {
+    CALENDAR_DAY_ORDER.forEach((d, dIdx) => {
         const h = document.createElement('div');
         h.className = 'cal-header';
         h.textContent = DAY_FULL[d] || d;
+        h.style.gridRow = '1';
+        h.style.gridColumn = String(dIdx + 2);
         grid.appendChild(h);
     });
 
     for (let i = 0; i < slots; i++) {
+        const rowNum = String(i + 2);
         const mins = SLOT_START + i * SLOT_SIZE;
         const h24 = Math.floor(mins / 60);
         const mm = String(mins % 60).padStart(2, '0');
@@ -945,13 +1000,71 @@ function renderCalendar(panel, schedule) {
         const timeCell = document.createElement('div');
         timeCell.className = 'cal-time';
         timeCell.textContent = `${h12}:${mm} ${period}`;
+        timeCell.style.gridRow = rowNum;
+        timeCell.style.gridColumn = '1';
         grid.appendChild(timeCell);
-        CALENDAR_DAY_ORDER.forEach(() => {
+        CALENDAR_DAY_ORDER.forEach((_, dIdx) => {
             const cell = document.createElement('div');
             cell.className = 'cal-cell';
+            cell.style.gridRow = rowNum;
+            cell.style.gridColumn = String(dIdx + 2);
             grid.appendChild(cell);
         });
     }
+
+    schedule.forEach((section, sIdx) => {
+        const parsedSlots = section._parsedSlots;
+        if (!parsedSlots || parsedSlots.length === 0) return;
+        const color = COLORS[sIdx % COLORS.length];
+
+        const byDay = {};
+        parsedSlots.forEach(t => {
+            (t.days || []).forEach(day => {
+                if (!byDay[day]) byDay[day] = [];
+                byDay[day].push({ start: t.start, end: t.end });
+            });
+        });
+
+        Object.entries(byDay).forEach(([day, intervals]) => {
+            const dayIdx = CALENDAR_DAY_ORDER.indexOf(day);
+            if (dayIdx === -1) return;
+
+            mergeDayIntervals(intervals).forEach(interval => {
+                const exactStart = Math.max(0, (interval.start - SLOT_START) / SLOT_SIZE);
+                const exactEnd = Math.min(slots, (interval.end - SLOT_START) / SLOT_SIZE);
+                if (exactStart >= slots || exactEnd <= 0 || exactEnd <= exactStart) return;
+
+                const firstSlot = Math.floor(exactStart);
+                const lastSlotExcl = Math.max(firstSlot + 1, Math.ceil(exactEnd));
+                const startRow = firstSlot + 2;
+                const endRow = lastSlotExcl + 2;
+                const topFrac = exactStart - firstSlot;
+                const bottomFrac = lastSlotExcl - exactEnd;
+
+                const event = document.createElement('div');
+                event.className = 'cal-event';
+                const timeRangeText = `${formatMinutes12(interval.start)} – ${formatMinutes12(interval.end)}`;
+                event.title = `${section['اسم المادة']} (${timeRangeText})`;
+
+                const titleEl = document.createElement('span');
+                titleEl.className = 'cal-event-title';
+                titleEl.textContent = section['اسم المادة'] || '';
+
+                const timeEl = document.createElement('span');
+                timeEl.className = 'cal-event-time';
+                timeEl.textContent = timeRangeText;
+
+                event.appendChild(titleEl);
+                event.appendChild(timeEl);
+                event.style.background = color;
+                event.style.gridColumn = String(dayIdx + 2);
+                event.style.gridRow = `${startRow} / ${endRow}`;
+                event.style.marginTop = `${Math.round(topFrac * 30) + 2}px`;
+                event.style.marginBottom = `${Math.round(bottomFrac * 30) + 2}px`;
+                grid.appendChild(event);
+            });
+        });
+    });
 
     const scrollWrap = document.createElement('div');
     scrollWrap.className = 'calendar-scroll-wrap';
@@ -959,44 +1072,6 @@ function renderCalendar(panel, schedule) {
 
     panel.innerHTML = '';
     panel.appendChild(scrollWrap);
-
-    const cells = grid.querySelectorAll('.cal-cell');
-    schedule.forEach((section, sIdx) => {
-        const parsedSlots = section._parsedSlots;
-        if (!parsedSlots || parsedSlots.length === 0) return;
-        const color = COLORS[sIdx % COLORS.length];
-
-        parsedSlots.forEach(t => {
-            (t.days || []).forEach(day => {
-                const dayIdx = CALENDAR_DAY_ORDER.indexOf(day);
-                if (dayIdx === -1) return;
-
-                const exactStart = (t.start - SLOT_START) / SLOT_SIZE;
-                const exactEnd = Math.min((t.end - SLOT_START) / SLOT_SIZE, slots);
-                if (exactStart >= slots || exactEnd <= 0) return;
-
-                const startSlot = Math.max(0, Math.floor(exactStart));
-                const anchorIdx = startSlot * CALENDAR_DAY_ORDER.length + dayIdx;
-                const anchorCell = cells[anchorIdx];
-                if (!anchorCell) return;
-
-                let cellH = anchorCell.getBoundingClientRect().height;
-                if (cellH < 10) cellH = 29;
-
-                const topOffsetFraction = Math.max(0, exactStart - startSlot);
-                const durationSlots = Math.max(0.1, exactEnd - exactStart);
-
-                const event = document.createElement('div');
-                event.className = 'cal-event';
-                event.title = `${section['اسم المادة']} — ${section['الاوقات']}`;
-                event.textContent = section['اسم المادة'] || '';
-                event.style.background = color;
-                event.style.top = `${topOffsetFraction * cellH + 1}px`;
-                event.style.height = `${durationSlots * cellH - 3}px`;
-                anchorCell.appendChild(event);
-            });
-        });
-    });
 }
 
 // =================== Export Schedule ===================
@@ -1096,6 +1171,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function checkDropdowns() {
         if (serverSelect.value === 'center') {
             subCollegeContainer.classList.add('visible');
+            preloadSubColleges(degreeSelect.value);
         } else {
             subCollegeContainer.classList.remove('visible');
             subCollegeSelect.value = '';
@@ -1107,20 +1183,28 @@ document.addEventListener('DOMContentLoaded', () => {
     serverSelect.addEventListener('change', checkDropdowns);
     degreeSelect.addEventListener('change', () => {
         btnLoadData.disabled = !serverSelect.value || !degreeSelect.value;
+        if (serverSelect.value === 'center') {
+            preloadSubColleges(degreeSelect.value);
+        }
     });
     checkDropdowns();
 
     subCollegeSelect.addEventListener('change', () => {
         currentSubCollege = subCollegeSelect.value;
         saveSelectionsToStorage();
-        loadCSV(false);
+        if (currentServer === 'center' && currentDegree &&
+            serverSelect.value === 'center' && degreeSelect.value === currentDegree) {
+            loadCSV(false);
+        }
     });
 
     btnLoadData.addEventListener('click', () => {
         if (currentServer !== serverSelect.value || currentDegree !== degreeSelect.value) {
             currentServer = serverSelect.value;
             currentDegree = degreeSelect.value;
-            if (currentServer !== 'center') {
+            if (currentServer === 'center') {
+                currentSubCollege = subCollegeSelect.value;
+            } else {
                 currentSubCollege = '';
                 subCollegeSelect.value = '';
             }

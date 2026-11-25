@@ -5,6 +5,7 @@ const {
     parseMultiSlots,
     parseSectionSlots,
     checkConflict,
+    mergeDayIntervals,
     scoreSchedule,
     solveSchedules
 } = require('../public/schedule-core');
@@ -67,6 +68,36 @@ test('scoreSchedule excludes online sections from days/breaks and supports sort 
     const morning = scoreSchedule([onsiteA, onsiteB], 'morning');
     const afternoon = scoreSchedule([onsiteA, onsiteB], 'afternoon');
     assert.ok(morning.total > 0 && afternoon.total > 0);
+});
+
+test('mergeDayIntervals merges contiguous and overlapping slots while preserving disjoint ones', () => {
+    const merged = mergeDayIntervals([
+        { start: 9 * 60 + 30, end: 10 * 60 },
+        { start: 8 * 60 + 30, end: 9 * 60 + 30 },
+        { start: 11 * 60, end: 12 * 60 }
+    ]);
+    assert.deepEqual(merged, [
+        { start: 8 * 60 + 30, end: 10 * 60 },
+        { start: 11 * 60, end: 12 * 60 }
+    ]);
+});
+
+test('scoreSchedule differentiates morning, afternoon, fewest_days, and least_breaks modes', () => {
+    // Schedule A: 3 morning days, 0 breaks, 8:30-10:30
+    const schedMorning = [
+        makeSection('M1', '1', 'ح ن ث 08:30 09:30'),
+        makeSection('M2', '1', 'ح ن ث 09:30 10:30')
+    ];
+    // Schedule B: 2 afternoon days, 60m break, 1:00-4:00 PM
+    const schedAfternoon = [
+        makeSection('M1', '2', 'ن ر 01:00 02:00'),
+        makeSection('M2', '2', 'ن ر 03:00 04:00')
+    ];
+
+    assert.ok(scoreSchedule(schedMorning, 'morning').total < scoreSchedule(schedAfternoon, 'morning').total);
+    assert.ok(scoreSchedule(schedAfternoon, 'afternoon').total < scoreSchedule(schedMorning, 'afternoon').total);
+    assert.ok(scoreSchedule(schedAfternoon, 'fewest_days').total < scoreSchedule(schedMorning, 'fewest_days').total);
+    assert.ok(scoreSchedule(schedMorning, 'least_breaks').total < scoreSchedule(schedAfternoon, 'least_breaks').total);
 });
 
 test('solveSchedules returns true Top-K, filters closed/excluded days, and reports pairwise & 3-way conflicts', () => {

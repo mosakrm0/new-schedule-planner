@@ -152,9 +152,27 @@
         return totalBreaks;
     }
 
+    function mergeDayIntervals(intervals) {
+        if (!Array.isArray(intervals) || intervals.length === 0) return [];
+        const sorted = [...intervals].sort((a, b) => a.start - b.start || a.end - b.end);
+        const merged = [{ start: sorted[0].start, end: sorted[0].end }];
+        for (let i = 1; i < sorted.length; i++) {
+            const cur = merged[merged.length - 1];
+            const next = sorted[i];
+            if (next.start <= cur.end) {
+                cur.end = Math.max(cur.end, next.end);
+            } else {
+                merged.push({ start: next.start, end: next.end });
+            }
+        }
+        return merged;
+    }
+
     function getTimeBounds(schedule) {
         let earliest = Infinity;
         let latest = -Infinity;
+        let startSum = 0;
+        let slotCount = 0;
         let hasOnsite = false;
 
         schedule.forEach(s => {
@@ -163,6 +181,8 @@
                 hasOnsite = true;
                 if (slot.start < earliest) earliest = slot.start;
                 if (slot.end > latest) latest = slot.end;
+                startSum += slot.start;
+                slotCount++;
             });
         });
 
@@ -171,13 +191,16 @@
                 (s._parsedSlots || []).forEach(slot => {
                     if (slot.start < earliest) earliest = slot.start;
                     if (slot.end > latest) latest = slot.end;
+                    startSum += slot.start;
+                    slotCount++;
                 });
             });
         }
 
         return {
             earliest: earliest === Infinity ? 0 : earliest,
-            latest: latest === -Infinity ? 0 : latest
+            latest: latest === -Infinity ? 0 : latest,
+            avgStart: slotCount > 0 ? Math.round(startSum / slotCount) : 0
         };
     }
 
@@ -185,29 +208,29 @@
         const mode = sortMode || 'balanced';
         const days = countDays(schedule);
         const breaks = countBreakMinutes(schedule);
-        const { earliest, latest } = getTimeBounds(schedule);
+        const { earliest, latest, avgStart } = getTimeBounds(schedule);
 
         let total;
         switch (mode) {
             case 'fewest_days':
-                total = days * 10000 + breaks;
+                total = days * 100000 + breaks * 10 + latest;
                 break;
             case 'least_breaks':
-                total = breaks * 100 + days * 500;
+                total = breaks * 10000 + days * 100 + latest;
                 break;
             case 'morning':
-                total = days * 3000 + breaks * 5 + latest;
+                total = latest * 1000 + avgStart * 100 + days * 50 + breaks;
                 break;
             case 'afternoon':
-                total = days * 3000 + breaks * 5 + (earliest > 0 ? (24 * 60 - earliest) : 0);
+                total = (24 * 60 - earliest) * 1000 + (24 * 60 - avgStart) * 100 + days * 50 + breaks;
                 break;
             case 'balanced':
             default:
-                total = days * 5000 + breaks * 10;
+                total = days * 1200 + breaks * 10 + Math.round(avgStart / 10);
                 break;
         }
 
-        return { days, breaks, earliest, latest, total };
+        return { days, breaks, earliest, latest, avgStart, total };
     }
 
     function filterCourseSections(sections, options) {
@@ -375,6 +398,7 @@
         checkConflict,
         countDays,
         countBreakMinutes,
+        mergeDayIntervals,
         getTimeBounds,
         scoreSchedule,
         filterCourseSections,
